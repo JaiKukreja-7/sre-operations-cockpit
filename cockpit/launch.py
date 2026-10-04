@@ -61,22 +61,34 @@ def main():
         signal.signal(sig, lambda *_: stop.set())
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, lambda *_: stop.set())
+    api_host = os.environ.get("COCKPIT_API_HOST", "127.0.0.1")
+    if api_host not in ("127.0.0.1", "0.0.0.0"):
+        print("COCKPIT_API_HOST must be 127.0.0.1 or 0.0.0.0", file=sys.stderr)
+        return 1
+    try:
+        api_port = int(os.environ.get("PORT", "8000"))
+        if not 1 <= api_port <= 65535 or api_port == 8001:
+            raise ValueError
+    except ValueError:
+        print("PORT must be 1-65535 and different from demo port 8001", file=sys.stderr)
+        return 1
     children = []
     try:
         # Refuse to attach to unrelated services that already occupy our ports.
-        for port in (8000, 8001):
+        for port in (api_port, 8001):
             with socket.socket() as connection:
                 connection.settimeout(.2)
                 # Detect live listeners, not TIME_WAIT sockets left after shutdown.
                 # Let Uvicorn perform the actual bind using its platform semantics.
                 if connection.connect_ex(("127.0.0.1", port)) == 0:
                     raise RuntimeError(f"Port {port} is already in use")
-        for app, port in (("cockpit.demo:app", 8001), ("cockpit.api:app", 8000)):
-            child = spawn(["-m", "uvicorn", app, "--host", "127.0.0.1", "--port", str(port)])
+        for app, host, port in (("cockpit.demo:app", "127.0.0.1", 8001), ("cockpit.api:app", api_host, api_port)):
+            child = spawn(["-m", "uvicorn", app, "--host", host, "--port", str(port)])
             children.append(child)
             wait_ready(child, port, stop)
         children.append(spawn(["-m", "cockpit.worker"]))
-        print("Demo :8001, API :8000, worker started. Press Ctrl+C to stop.", flush=True)
+        print(f"Demo :8001, API :{api_port}, worker started. Press Ctrl+C to stop.", flush=True)
+        print(f"Dashboard: http://127.0.0.1:{api_port} | API documentation: /docs", flush=True)
         while not stop.wait(.2):
             for child in children:
                 if child.poll() is not None:
