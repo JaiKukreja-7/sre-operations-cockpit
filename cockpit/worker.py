@@ -3,7 +3,6 @@ import argparse
 import os
 import signal
 import threading
-import time
 from contextlib import contextmanager
 import httpx
 from cockpit.db import Store
@@ -55,8 +54,8 @@ def tick(store, client, now=None):
 
 
 def run(store, stop):
-    store.initialize()
-    with worker_lock(store.path.with_suffix(".worker.lock")):
+    with worker_lock(store.lock_path):
+        store.initialize()
         store.recover_interrupted()
         with httpx.Client(trust_env=False, follow_redirects=False) as client:
             while not stop.is_set():

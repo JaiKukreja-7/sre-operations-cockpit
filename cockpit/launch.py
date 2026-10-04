@@ -10,6 +10,9 @@ from pathlib import Path
 import httpx
 
 ROOT = Path(__file__).resolve().parent.parent
+# Allow the maximum supported 60-second request timeout plus SQLite contention
+# and cleanup. Ordinary shutdown returns as soon as children exit.
+SHUTDOWN_GRACE_SECONDS = 75
 
 
 def spawn(args):
@@ -17,14 +20,14 @@ def spawn(args):
     return subprocess.Popen([sys.executable, *args], cwd=ROOT, **options)
 
 
-def stop_children(children):
+def stop_children(children, grace_seconds=SHUTDOWN_GRACE_SECONDS):
     for child in reversed(children):
         if child.poll() is None:
             try:
                 child.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGTERM)
             except (ProcessLookupError, OSError):
                 pass
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + grace_seconds
     for child in reversed(children):
         try:
             child.wait(timeout=max(.1, deadline - time.monotonic()))

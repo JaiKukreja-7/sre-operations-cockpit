@@ -92,10 +92,16 @@ The launcher starts three separate processes using the same virtual environment:
 - Worker: `python -m cockpit.worker`; the API never runs probes itself.
 
 The launcher checks each HTTP service before starting the worker, detects child
-exits, and shuts down all children on Ctrl+C or failure. Shutdown allows up to ten
-seconds before forcibly stopping remaining children. All children are reaped.
+exits, and shuts down all children on Ctrl+C or failure. Ordinary shutdown returns
+as soon as children exit. Shutdown allows up to 75 seconds before forcibly stopping
+unresponsive children, accommodating the supported 60-second request timeout plus
+database contention and cleanup. All children are reaped.
 The worker has an OS file lock: a second worker for the same database exits with
-an error, and the lock is released by the OS after normal exit or a crash.
+an error, and the lock is released by the OS after normal exit or a crash. The lock
+filename appends `.worker.lock` to the complete database filename, so `x.db` and
+`x.sqlite` have independent locks. The file may remain after shutdown; its presence
+does not mean a worker is running. Stop services before updating the checkout or
+dependencies, including upgrades from the original Phase 1 lock naming scheme.
 
 SQLite is created automatically at `data/cockpit.db`, with WAL mode and short
 transactions. The API and worker open their own connections. `COCKPIT_DB` may
@@ -179,6 +185,12 @@ saved. Its first slot is immediately eligible; later slots occur at the configur
 interval. A no-op PUT keeps the original schedule. Changing or disabling a check
 closes the old schedule; historical eligibility and assertion settings remain
 intact. An already claimed request finishes with the configuration it claimed.
+Unclaimed slots from retired configurations become UNKNOWN and are never probed,
+even when still within their dispatch grace period. Summary inference applies the
+same rule before the worker has backfilled those slots. Configuration boundaries
+remain chronological if the system clock moves backward, and cannot remove an
+already claimed slot from eligibility. New slots wait until the clock reaches
+their preserved schedule.
 
 The worker has a one-second dispatch grace period. If it cannot start a request
 within that period, it records UNKNOWN for the slot. Missed slots are not replayed
@@ -275,13 +287,20 @@ restart behavior. The integration test launches real services and a worker,
 drives all four modes over HTTP, rejects a second worker, shuts down all children,
 and restarts against the same database. It requires free ports 8000 and 8001.
 
-Validation: **28 tests passed** with Python **3.11.16** on Linux; one upstream
+Review validation: **42 tests passed** with Python **3.11.16** on Linux; one upstream
 Starlette/AnyIO deprecation warning was emitted. Dependency validation with
 `python -m pip check` found no conflicts. The POSIX startup wrapper was also
-executed from another working directory and shut down cleanly. Native Intel macOS
-Monterey and Windows startup/console handling still require testing on those OSes;
-Linux results do not establish OS-specific behavior. Windows locking and signal
-branches are present but cannot be executed by Linux tests.
+executed from another working directory and shut down cleanly. Additional review
+regressions cover retired schedules, equal timestamps and clock rollback, distinct
+database locks, concurrent initialization and SQLite readers/writers, a real worker
+process killed during a request, and graceful shutdown during an 11-second valid
+probe. Forced cleanup of unresponsive children is tested separately.
+
+Native Intel macOS Monterey and Windows startup/console handling still require
+testing on those OSes; Linux results do not establish OS-specific behavior.
+Windows process-group and shutdown-signal selection are unit-tested using mocks,
+not a Windows kernel. Native `msvcrt` locking, batch startup, and console signal
+delivery remain unverified.
 
 ## Phase 2 dashboard
 

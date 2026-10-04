@@ -80,7 +80,7 @@ def test_real_demo_sequence_duplicate_worker_shutdown_and_restart(tmp_path):
                 pass
             else:
                 raise AssertionError(f'Child service on {port} still running')
-        with worker_lock(db.with_suffix('.worker.lock')):
+        with worker_lock(db.with_name(db.name + '.worker.lock')):
             pass
         process = start(log, env)
         try:
@@ -119,3 +119,120 @@ def test_shell_wrapper_startup_and_shutdown(tmp_path):
                 pass
             else:
                 raise AssertionError(f'Shell wrapper left service on {port} running')
+
+
+def test_killed_worker_recovers_pending_slot_without_replaying(tmp_path):
+    from cockpit.db import Store
+    db = tmp_path / 'crash.db'
+    store = Store(db)
+    options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
+    env = dict(os.environ, COCKPIT_DB=str(db))
+    with (tmp_path / 'crash.log').open('w') as log, httpx.Client(
+            base_url='http://127.0.0.1:8001', trust_env=False, timeout=3) as client:
+        demo = subprocess.Popen([sys.executable, '-m', 'uvicorn', 'cockpit.demo:app',
+                                 '--host', '127.0.0.1', '--port', '8001'], cwd=ROOT,
+                                env=env, stdout=log, stderr=subprocess.STDOUT, **options)
+        worker = None
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                assert demo.poll() is None
+                try:
+                    if client.get('/health').status_code == 200:
+                        break
+                except httpx.HTTPError:
+                    pass
+                time.sleep(.05)
+            else:
+                raise AssertionError('Demo failed to start')
+            assert client.put('/mode', json={'mode': 'Slow', 'delay_seconds': 1.5}).status_code == 200
+            store.initialize()
+            worker = subprocess.Popen([sys.executable, '-m', 'cockpit.worker'], cwd=ROOT,
+                                      env=env, stdout=log, stderr=subprocess.STDOUT, **options)
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                assert worker.poll() is None
+                with store.connect() as conn:
+                    pending = conn.execute("SELECT * FROM results WHERE outcome='PENDING'").fetchone()
+                if pending:
+                    break
+                time.sleep(.02)
+            else:
+                raise AssertionError('Worker never claimed a request')
+            # Terminate the actual process during its request; no cleanup runs.
+            worker.kill()
+            worker.wait(timeout=5)
+            assert client.put('/mode', json={'mode': 'Healthy'}).status_code == 200
+            worker = subprocess.Popen([sys.executable, '-m', 'cockpit.worker'], cwd=ROOT,
+                                      env=env, stdout=log, stderr=subprocess.STDOUT, **options)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                assert worker.poll() is None
+                rows = store.recent(1)
+                if any(row['outcome'] == 'GOOD' and row['scheduled_at'] > pending['scheduled_at'] for row in rows):
+                    break
+                time.sleep(.05)
+            else:
+                raise AssertionError('Replacement worker produced no later GOOD result')
+            interrupted = [row for row in rows if row['scheduled_at'] == pending['scheduled_at']]
+            assert len(interrupted) == 1
+            assert interrupted[0]['id'] == pending['id']
+            assert interrupted[0]['outcome'] == 'UNKNOWN'
+            assert 'interrupted' in interrupted[0]['failure_reason']
+            assert interrupted[0]['http_status'] is None
+            assert interrupted[0]['latency_ms'] is None
+        finally:
+            for child in (worker, demo):
+                if child is not None and child.poll() is None:
+                    child.send_signal(signal.CTRL_BREAK_EVENT if os.name == 'nt' else signal.SIGTERM)
+                    try:
+                        child.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait()
+        with worker_lock(store.lock_path):
+            pass
+
+
+def test_shutdown_during_long_valid_probe_preserves_result(tmp_path):
+    from cockpit.db import Store
+    from cockpit.models import CheckConfig
+    db = tmp_path / 'long-probe.db'
+    store = Store(db)
+    store.initialize()
+    # The previous ten-second supervisor deadline killed this valid probe.
+    store.update_check(1, CheckConfig(timeout_seconds=14, interval_seconds=15,
+                                   latency_threshold_ms=12000), now=time.time())
+    env = dict(os.environ, COCKPIT_DB=str(db))
+    with (tmp_path / 'long.log').open('w') as log, httpx.Client(
+            base_url='http://127.0.0.1:8000', trust_env=False, timeout=3) as client:
+        process = start(log, env)
+        try:
+            ready(process, client)
+            assert client.put('/api/demo', json={'mode': 'Slow', 'delay_seconds': 11}).status_code == 200
+            # Reconfigure to make a fresh slot immediately eligible.
+            config = CheckConfig(name='long shutdown probe', timeout_seconds=14,
+                                 interval_seconds=15, latency_threshold_ms=12000)
+            assert client.put('/api/checks/1', json=config.model_dump()).status_code == 200
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with store.connect() as conn:
+                    pending = conn.execute("SELECT * FROM results WHERE outcome='PENDING'").fetchone()
+                if pending:
+                    # Ensure the HTTP request actually reached the delayed endpoint.
+                    time.sleep(.3)
+                    break
+                time.sleep(.02)
+            else:
+                raise AssertionError('No long probe claimed')
+            shutdown(process)
+            rows = store.recent(1)
+            result = next(row for row in rows if row['id'] == pending['id'])
+            assert result['outcome'] == 'GOOD'
+            assert result['latency_ms'] >= 10000
+            assert result['http_status'] == 200
+        finally:
+            if process.poll() is None:
+                shutdown(process)
+        with worker_lock(store.lock_path):
+            pass

@@ -37,15 +37,20 @@ def _window(conn, check_id, start, end, target):
         first = max(0, math.ceil((lower - schedule["start"]) / interval))
         stop = max(0, math.ceil((upper - schedule["start"]) / interval))
         eligible += max(0, stop - first)
-        overdue_stop = max(0, math.ceil((min(upper, cutoff) - schedule["start"]) / interval))
+        # A retired, unclaimed slot can no longer be dispatched, even when its
+        # ordinary grace period has not elapsed. Claimed rows are subtracted below.
+        overdue_upper = upper if schedule["end"] is not None and schedule["end"] <= end else min(upper, cutoff)
+        overdue_stop = max(0, math.ceil((overdue_upper - schedule["start"]) / interval))
         overdue_eligible += max(0, overdue_stop - first)
     counts = {"GOOD": 0, "BAD": 0, "UNKNOWN": 0, "PENDING": 0}
     for row in conn.execute("""SELECT outcome,COUNT(*) AS n FROM results
         WHERE check_id=? AND scheduled_at>=? AND scheduled_at<? GROUP BY outcome""", (check_id, start, end)):
         counts[row["outcome"]] = row["n"]
-    overdue_recorded = conn.execute("""SELECT COUNT(*) FROM results
-        WHERE check_id=? AND scheduled_at>=? AND scheduled_at<?""",
-        (check_id, start, cutoff)).fetchone()[0]
+    overdue_recorded = conn.execute("""SELECT COUNT(*) FROM results r
+        JOIN schedules s ON s.id=r.schedule_id
+        WHERE r.check_id=? AND r.scheduled_at>=? AND r.scheduled_at<?
+        AND (r.scheduled_at<? OR (s.end IS NOT NULL AND s.end<=?))""",
+        (check_id, start, end, cutoff, end)).fetchone()[0]
     inferred_unknown = max(0, overdue_eligible - overdue_recorded)
     result = calculate(counts["GOOD"], counts["BAD"], counts["UNKNOWN"] + inferred_unknown, eligible,
                        target, counts["PENDING"])

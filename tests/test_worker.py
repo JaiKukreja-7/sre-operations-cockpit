@@ -124,3 +124,53 @@ def test_dispatch_time_is_evaluated_after_write_lock(store, monkeypatch):
         job = future.result(timeout=5)
     assert job['missed'] is True
     assert store.recent(1)[0]['outcome'] == 'UNKNOWN'
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_retired_slots_never_dispatch_old_configuration(store, enabled):
+    from cockpit.reliability import window
+    replacement = CheckConfig(enabled=enabled, required_text='new config')
+    store.update_check(1, replacement, now=100.2)
+    before = window(store, 1, 99, 100.3, .95)
+    assert before['inferred_unknown'] == 1
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, text='new config')
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert tick(store, client, now=100.3)
+        assert not seen
+        retired = store.recent(1)[0]
+        assert retired['outcome'] == 'UNKNOWN'
+        assert 'retired' in retired['failure_reason']
+        after = window(store, 1, 99, 100.3, .95)
+        assert after['unknown'] == before['unknown']
+        assert after['inferred_unknown'] == 0
+        assert tick(store, client, now=100.3) is enabled
+    assert len(seen) == int(enabled)
+    if enabled:
+        assert store.recent(1)[0]['outcome'] == 'GOOD'
+
+
+def test_claimed_probe_can_complete_after_disable(store):
+    from cockpit.reliability import window
+    job = store.claim_next(100)
+    store.update_check(1, CheckConfig(enabled=False), now=100.2)
+    before = window(store, 1, 99, 100.3, .95)
+    assert before['pending'] == 1
+    assert before['unknown'] == 0
+    store.complete(job['result_id'], dict(outcome='GOOD', http_status=200,
+                   latency_ms=200, failure_reason=None), now=100.3)
+    after = window(store, 1, 99, 100.4, .95)
+    assert after['good'] == 1
+    assert after['sample_coverage'] == 1
+
+
+def test_distinct_database_extensions_have_independent_worker_locks(tmp_path):
+    first = Store(tmp_path / 'cockpit.db')
+    second = Store(tmp_path / 'cockpit.sqlite')
+    assert first.lock_path != second.lock_path
+    with worker_lock(first.lock_path), worker_lock(second.lock_path):
+        with pytest.raises(RuntimeError):
+            with worker_lock(first.lock_path):
+                pass

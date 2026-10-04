@@ -107,3 +107,37 @@ def test_summary_uses_one_snapshot_during_concurrent_completion(tmp_path, monkey
     assert result['alert']['long']['observed_events'] == 0
     monkeypatch.setattr(reliability, '_window', original)
     assert reliability.summary(store, 1, 'demo', 101)['summary']['observed_events'] == 1
+
+
+def test_equal_timestamp_disable_keeps_claimed_slot_eligible(tmp_path):
+    store = Store(tmp_path / 'test.db')
+    store.initialize(now=100)
+    job = store.claim_next(100)
+    store.complete(job['result_id'], dict(outcome='GOOD', http_status=200,
+                   latency_ms=1, failure_reason=None), now=100.1)
+    store.update_check(1, CheckConfig(enabled=False), now=100)
+    values = window(store, 1, 99, 101, .95)
+    assert values['eligible_slots'] == values['observed_events'] == 1
+    assert values['sample_coverage'] == 1
+
+
+def test_clock_rollback_does_not_overlap_configuration_epochs(tmp_path):
+    store = Store(tmp_path / 'test.db')
+    store.initialize(now=100)
+    store.update_check(1, CheckConfig(interval_seconds=10), now=110)
+    store.update_check(1, CheckConfig(interval_seconds=5), now=105)
+    # Old slots 100,105; replacement slots 110,115. No retroactive slot at 105.
+    assert window(store, 1, 99, 116, .95)['eligible_slots'] == 4
+    with store.connect() as conn:
+        schedules = conn.execute('SELECT start,end FROM schedules ORDER BY id').fetchall()
+    assert all(row['end'] is None or row['end'] >= row['start'] for row in schedules)
+    assert all(schedules[index]['end'] <= schedules[index+1]['start']
+               for index in range(len(schedules) - 1))
+
+
+def test_first_enable_of_initially_disabled_check(tmp_path):
+    store = Store(tmp_path / 'test.db')
+    store.initialize(now=100)
+    check_id = store.create_check(CheckConfig(enabled=False), now=100)
+    store.update_check(check_id, CheckConfig(), now=105)
+    assert window(store, check_id, 99, 111, .95)['eligible_slots'] == 2

@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import sqlite3
 import time
@@ -13,6 +14,11 @@ DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "cockpit.db"
 class Store:
     def __init__(self, path=None):
         self.path = Path(path or os.environ.get("COCKPIT_DB", DEFAULT_DB)).resolve()
+
+    @property
+    def lock_path(self):
+        # Append to the full filename: x.db and x.sqlite are distinct stores.
+        return self.path.with_name(self.path.name + ".worker.lock")
 
     @contextmanager
     def connect(self):
@@ -91,6 +97,15 @@ class Store:
             encoded = config.model_dump_json()
             if existing["config"] == encoded:
                 return
+            # Wall-clock rollback and equal timestamps must not overlap schedule
+            # epochs or retroactively remove an already claimed eligible slot.
+            boundaries = conn.execute("""SELECT MAX(start), MAX(end) FROM schedules
+                WHERE check_id=?""", (check_id,)).fetchone()
+            latest_slot = conn.execute("SELECT MAX(scheduled_at) FROM results WHERE check_id=?",
+                                       (check_id,)).fetchone()[0]
+            now = max([now, *(value for value in boundaries if value is not None)])
+            if latest_slot is not None and now <= latest_slot:
+                now = math.nextafter(latest_slot, math.inf)
             conn.execute("UPDATE schedules SET end=? WHERE check_id=? AND end IS NULL", (now, check_id))
             conn.execute("UPDATE checks SET config=? WHERE id=?", (encoded, check_id))
             if config.enabled:
@@ -115,12 +130,14 @@ class Store:
             slot = row["next_slot"]
             conn.execute("UPDATE schedules SET next_slot=? WHERE id=?",
                          (slot + config.interval_seconds, row["id"]))
-            missed = now - slot > DISPATCH_GRACE_SECONDS
+            retired = row["end"] is not None
+            missed = retired or now - slot > DISPATCH_GRACE_SECONDS
             cursor = conn.execute("""INSERT OR IGNORE INTO results
                 (check_id,schedule_id,scheduled_at,completed_at,outcome,failure_reason)
                 VALUES (?,?,?,?,?,?)""", (row["check_id"], row["id"], slot,
                                          now if missed else None,
                                          "UNKNOWN" if missed else "PENDING",
+                                         "configuration retired before dispatch" if retired else
                                          "scheduled slot missed" if missed else None))
             return {"result_id": cursor.lastrowid if cursor.rowcount else None,
                     "config": config, "missed": missed, "scheduled_at": slot}
