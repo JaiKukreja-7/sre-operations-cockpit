@@ -77,6 +77,7 @@ def main():
             wait_ready(child, port, stop)
         children.append(spawn(["-m", "cockpit.worker"]))
         print("Demo :8001, API :8000, worker started. Press Ctrl+C to stop.", flush=True)
+        print("Dashboard: http://127.0.0.1:8000 | API documentation: /docs", flush=True)
         while not stop.wait(.2):
             for child in children:
                 if child.poll() is not None:

@@ -1,9 +1,10 @@
 # SRE Synthetic Monitoring and Error-Budget Operations Cockpit
 
-Phase 1: a local FastAPI demo service, monitoring API, independent monitoring worker,
-and SQLite event history. Python **3.11** is required. Intended platforms are Intel
+Phase 2: a React operations dashboard served by FastAPI, with the Phase 1 local
+demo service, independent monitoring worker, and SQLite event history. Python **3.11** is required. Intended platforms are Intel
 macOS Monterey 12.6.8 and Windows 10/11. No Docker, paid service, API key, or database
-server is needed. There is no React frontend in this phase.
+server is needed. The production dashboard is included in Git; normal startup
+requires Python only, with no Node server or frontend dependency installation.
 
 ## First-time installation: macOS
 
@@ -28,6 +29,7 @@ From the repository directory, after installation:
 bash start_mac.sh
 ```
 
+Open `http://127.0.0.1:8000` in your browser after the terminal reports startup.
 The script finds the repository directory even if launched from elsewhere. Keep
 Terminal open; press **Ctrl+C** to stop the demo, API, and worker together.
 
@@ -63,6 +65,7 @@ From Command Prompt in the repository directory, after installation:
 start_windows.bat
 ```
 
+Open `http://127.0.0.1:8000` in your browser after startup.
 Keep the console open; press **Ctrl+C** to stop all three processes. If Command
 Prompt asks whether to terminate the batch job, answer `Y` after shutdown. From
 PowerShell the equivalent startup is `.\start_windows.bat`.
@@ -88,7 +91,8 @@ and retry; the launcher will not attach to an unrelated service.
 The launcher starts three separate processes using the same virtual environment:
 
 - Demo: `127.0.0.1:8001`, with `/probe`, `/mode`, `/health`, and `/docs`.
-- API: `127.0.0.1:8000`, with `/api/...`, `/health`, and `/docs`.
+- Dashboard and API: `127.0.0.1:8000`, with the dashboard at `/`, plus `/api/...`,
+  `/health`, and `/docs`. Hashed production assets are served from `/assets/`.
 - Worker: `python -m cockpit.worker`; the API never runs probes itself.
 
 The launcher checks each HTTP service before starting the worker, detects child
@@ -304,9 +308,125 @@ delivery remain unverified.
 
 ## Phase 2 dashboard
 
-Add a React dashboard consuming the `/api` contract: check configuration forms,
-recent outcomes with latency/failure reasons, separate SLI and coverage cards,
-negative error-budget visualization, a demo/thirty-day policy selector, and
-short/long burn-rate indicators. Include demo controls and a clear insufficient-
-data state. Add an explicit local development CORS allowlist if React uses another
-port. Keep scheduling and reliability calculations in the backend.
+The dashboard at `http://127.0.0.1:8000` reads real backend responses. It includes
+check selection and configuration, separate SLI and coverage cards, GOOD/BAD/UNKNOWN
+counts, negative remaining budgets, backend burn rates and alerts, recent results,
+a latency chart, policy selection, and demo controls. All event/window timestamps
+are explicitly displayed in UTC.
+
+Select a check and policy at the top. The reporting period, exact boundaries, SLO
+target, and alert windows come from the backend. Recent results/chart show up to
+100 completed results, independently of the selected reporting window. Empty/null
+metrics display **No data**, while valid zero values stay zero. UNKNOWN rows have
+no invented HTTP status or latency. Chart segments break at null latency values
+and timestamp gaps longer than 1.5 times the current interval; historical interval
+changes may therefore create conservative extra gaps. It never fills in samples.
+
+Change interval, timeout, expected status, required text, or latency threshold in
+**Assertions & schedule**, then click **Save configuration**. Interval is a whole
+number from 1–3600 seconds; timeout is positive, at most 60 seconds, and strictly
+less than interval. Status is an integer from 100–599; latency threshold is positive
+and at most 60000 ms. Empty required text disables that assertion. The target URL
+is fixed to the allowed local demo service. Edits are preserved during polling.
+The backend remains the final validation authority; field errors are displayed.
+
+Set **Slow delay** to `0.8`, then click Healthy → Slow → Failing → Healthy, leaving
+each mode active for at least the next five-second scheduled result. Expect GOOD,
+BAD with HTTP 200/latency failure, BAD with HTTP 500, then GOOD. Budget failures
+remain in the selected window after recovery. Switching policy does not reset
+history. Demo-mode errors are displayed independently of monitoring results.
+
+A single queue serializes every dashboard request, including control mutations.
+Polling starts every five seconds when requests finish in time; slow requests
+finish before another cycle begins. Requests time out after ten seconds. Obsolete
+selection/policy requests are cancelled. Connection failures retain the last
+successful response with an explicit stale-data warning; **Retry connection**
+starts a fresh cycle. There are no simulated production results or frontend SLI,
+coverage, budget, burn-rate, or alert calculations.
+
+### Rebuild the dashboard (only when changing frontend code)
+
+Use **Node.js 22.x, version 22.12.0 or newer**. The tested version is **22.23.3**,
+also pinned in `frontend/.nvmrc`. Do not select the newer default Node major.
+Install a Node 22 x64 package from the official Node website/archive, then open a
+new terminal and run `node --version` to confirm `v22...`.
+
+The [official Node 22 platform table](https://github.com/nodejs/node/blob/v22.23.3/BUILDING.md#platform-list)
+lists Intel macOS x64 **11.0+** and Windows **10+**; the macOS binary deployment
+target is 11.0. This supports Monterey 12.6.8 and Windows 10/11 at the toolchain
+level. The Vite build targets ES2020 for the browser. Native target-OS execution
+has not been tested; this compatibility evidence is not an OS test result.
+
+Stop cockpit processes before rebuilding. macOS Terminal, from the repository:
+
+```bash
+cd frontend
+npm ci
+npm run check
+npm test
+npm run build
+cd ..
+bash start_mac.sh
+```
+
+Windows Command Prompt, from the repository:
+
+```bat
+cd frontend
+npm ci
+npm run check
+npm test
+npm run build
+cd ..
+start_windows.bat
+```
+
+`npm ci` uses the committed dependency lockfile. `npm run build` checks TypeScript
+and writes the production bundle to `cockpit/static/dashboard/`. Commit that
+bundle with frontend changes so users can run with Python only. Building does not
+change dependencies or lockfiles. A missing bundle produces an explanatory 503
+page while APIs and `/docs` remain available. No CORS configuration is needed for
+the same-origin bundled dashboard.
+
+Optional frontend development: start the Python services, then `cd frontend` and
+`npm run dev`. Vite binds to `127.0.0.1:5173` and proxies `/api` to port 8000; stop
+Vite separately with Ctrl+C. This extra Node process is only for editing frontend
+code. API documentation is at port 8000 `/docs`.
+
+### Browser verification
+
+Stop other cockpit services first; automated browser tests start their own demo,
+API, worker, and temporary SQLite database on ports 8000/8001. They leave normal
+user data untouched, produce genuine HTTP probe events, and shut down their test
+services afterwards. Browser automation is optional and separate from running or
+building the dashboard.
+
+After installing frontend dependencies, from `frontend/`:
+
+```text
+npx playwright install chromium
+npm run test:e2e
+```
+
+A compatible system Chromium can instead be selected with
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE` (full executable path). The default Python
+interpreter is the repository's `.venv`; `COCKPIT_TEST_PYTHON` can override it.
+Playwright browser/platform support must be checked separately on older OSes;
+Monterey and Windows 10 were not used for browser automation here.
+
+The browser suite covers the real four-mode sequence, five-second serialized
+refreshes, negative budgets, policy boundaries, configuration validation and save,
+empty/null data, selection, offline recovery, mobile layout, and UNKNOWN/chart
+gaps caused by real overload of the serial worker. It never inserts synthetic
+result rows. Browser screenshots and failure traces are local ignored artifacts
+in `frontend/test-results/`.
+
+Phase 2 validation on Linux: **44 backend tests**, **9 frontend tests**, and
+**3 Chromium browser tests** passed, including the real four-mode sequence.
+TypeScript checks, `npm ci`, and the production build passed with Node 22.23.3.
+Chromium 151 was used; the backend ran on Python 3.11.16. One upstream
+Starlette/AnyIO deprecation warning remains. Browser tests confirmed no overlapping
+dashboard API requests, negative budgets, UNKNOWN gaps, and mobile/offline states.
+Native Intel Monterey, Windows 10/11, and Safari remain untested. The separate
+worker, loopback bindings, demo service, and Phase 1 reliability formulas are
+preserved. Phase 1 PR remains unmerged; Phase 2 targets `phase-1-backend`.

@@ -1,8 +1,11 @@
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from cockpit.db import Store
 from cockpit.models import CheckConfig, DemoControl, Policy
 from cockpit.reliability import summary, timestamp
@@ -10,7 +13,7 @@ from cockpit.reliability import summary, timestamp
 PolicyName = Literal["demo", "thirty_day"]
 
 
-def create_app(db_path=None):
+def create_app(db_path=None, dashboard_dir=None):
     store = Store(db_path)
 
     @asynccontextmanager
@@ -88,6 +91,15 @@ def create_app(db_path=None):
     async def demo_control(control: DemoControl):
         return await demo_request("PUT", control)
 
+    dashboard = Path(dashboard_dir) if dashboard_dir is not None else Path(__file__).resolve().parent / "static" / "dashboard"
+    if (dashboard / "index.html").is_file():
+        # Registered last so API, /docs, and OpenAPI keep their existing routes.
+        app.mount("/", StaticFiles(directory=dashboard, html=True), name="dashboard")
+    else:
+        @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+        def missing_dashboard():
+            return HTMLResponse("<h1>Dashboard build missing</h1><p>See README: run npm ci "
+                                "and npm run build in frontend, then restart.</p>", status_code=503)
     return app
 
 
